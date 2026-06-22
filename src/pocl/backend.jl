@@ -7,8 +7,6 @@ using ..POCL: device, clconvert, clfunction
 import KernelAbstractions as KA
 import KernelAbstractions.KernelIntrinsics as KI
 
-import StaticArrays
-
 import Adapt
 
 
