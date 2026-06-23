@@ -268,6 +268,121 @@ function sub_group_barrier()
     error("Sub-group barrier used outside kernel or not captured")
 end
 
+# ── Internal helpers: reinterpret a scalar pointer to an N-element vector pointer ──
+#
+# On CPU  : pointer(arr, idx) → Ptr{T}          → Ptr{NTuple{N, VecElement{T}}}
+# On GPU  : pointer(arr, idx) → LLVMPtr{T, AS}  → LLVMPtr{NTuple{N, VecElement{T}}, AS}
+#
+# NTuple{N, Core.VecElement{T}} lowers to LLVM's `<N x T>` vector type, which
+# the backend (NVPTX / AMDGPU) emits as a single wide memory instruction
+# (e.g. ld.global.v4.f32 / global_load_dwordx4) — exactly like PyTorch's
+# aligned_vector<scalar_t, N> trick, but backend-agnostic.
+#
+# We dispatch on pointer type rather than wrapping in a single generic method so
+# that GPU kernels only ever see the LLVMPtr branch (no dead Ptr branch in device IR).
+@inline _vptr(p::Ptr{T},              ::Val{N}) where {T, N}     =
+    Ptr{NTuple{N, Core.VecElement{T}}}(p)
+@inline _vptr(p::Core.LLVMPtr{T, AS}, ::Val{N}) where {T, N, AS} =
+    reinterpret(Core.LLVMPtr{NTuple{N, Core.VecElement{T}}, AS}, p)
+
+# ─── vload ───────────────────────────────────────────────────────────────────
+
+"""
+    vload(::Val{N}, arr::AbstractArray{T}, idx::Integer) → NTuple{N, T}
+
+Load `N` consecutive elements starting at 1-based index `idx` from `arr`.
+
+### How it works
+
+For primitive element types (`Float32`, `Float64`, `Int32`, etc.) this casts
+`pointer(arr, idx)` to a `<N x T>` LLVM vector pointer and issues a single
+wide `unsafe_load`.  The resulting LLVM IR is:
+
+```
+load <N x T>, <N x T>* ptr, align N*sizeof(T)
+```
+
+On CUDA this lowers to `ld.global.v4.f32` (for `N=4, T=Float32`); on AMDGPU
+to `global_load_dwordx4`.  This is the same strategy as PyTorch's
+`aligned_vector<scalar_t, N>` — a pointer cast to the vector type followed
+by a single load, with no reliance on LLVM's LoadStoreVectorizer pass.
+
+For non-primitive types the fallback emits N scalar loads (LLVM may still
+vectorise them, but there is no guarantee).
+
+### Requirements
+
+- `N` must be a **compile-time constant** — pass `Val(4)`, not a variable.
+- The array must **not** be annotated with `@Const`; `@Const` inserts `ldg`
+  (read-only cache) intrinsics whose pointer type differs from a plain global
+  load and cannot be widened into a vector load.
+- `idx` must be aligned to `N * sizeof(T)` bytes for the hardware vector
+  instruction to fire.  Julia's allocator guarantees ≥ 64-byte base alignment,
+  so `idx = 1 + k*N` for `k ≥ 0` is always valid.
+
+### Example
+
+```julia
+function reduce_kernel(dst, src)
+    g   = KI.get_global_id().x
+    idx = (g - 1) * 4 + 1
+    v0, v1, v2, v3 = KI.vload(Val(4), src, idx)   # single ld.global.v4.f32
+    KI.vstore!(dst, idx, (v0+1f0, v1+1f0, v2+1f0, v3+1f0))
+    return
+end
+```
+
+!!! note
+    Backends **may** provide an override with additional alignment hints or
+    cache-modifier control:
+    ```julia
+    @device_override @inline KI.vload(::Val{N}, arr::AbstractArray{T}, idx::Integer) where {N, T}
+    ```
+"""
+@inline function vload(::Val{N}, arr::AbstractArray{T}, idx::Integer) where {N, T}
+    if isprimitivetype(T) && N > 1
+        # Explicit <N x T> vector load — guaranteed single wide instruction
+        raw = unsafe_load(_vptr(pointer(arr, idx), Val(N)))
+        ntuple(i -> raw[i].value, Val(N))
+    else
+        # N=1 or non-primitive: plain scalar loads (VecElement<1x> is invalid in SPIRV/OpenCL)
+        ntuple(i -> @inbounds(arr[idx + i - 1]), Val(N))
+    end
+end
+
+# ─── vstore! ─────────────────────────────────────────────────────────────────
+
+"""
+    vstore!(arr::AbstractArray{T}, idx::Integer, vals::NTuple{N, T})
+
+Store `N` consecutive elements from `vals` into `arr` starting at 1-based
+index `idx`.
+
+The write complement of [`vload`](@ref).  For primitive element types this
+wraps `vals` in a `<N x T>` LLVM vector and calls a single `unsafe_store!`,
+emitting `st.global.v4.f32` (CUDA) or `global_store_dwordx4` (AMDGPU).
+
+The same `N`-must-be-`Val`, no-`@Const`, and alignment requirements as
+[`vload`](@ref) apply.
+
+!!! note
+    Backends **may** provide an override:
+    ```julia
+    @device_override @inline KI.vstore!(arr::AbstractArray{T}, idx::Integer, vals::NTuple{N, T}) where {N, T}
+    ```
+"""
+@inline function vstore!(arr::AbstractArray{T}, idx::Integer, vals::NTuple{N, T}) where {N, T}
+    if isprimitivetype(T) && N > 1
+        vec_vals = ntuple(i -> Core.VecElement{T}(vals[i]), Val(N))
+        unsafe_store!(_vptr(pointer(arr, idx), Val(N)), vec_vals)
+    else
+        for i in 1:N
+            @inbounds arr[idx + i - 1] = vals[i]
+        end
+    end
+    return nothing
+end
+
 """
     _print(args...)
 
