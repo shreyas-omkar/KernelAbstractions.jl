@@ -270,18 +270,23 @@ end
 
 # ── Internal helpers for wide vector loads / stores ───────────────────────────
 #
-# CPU  (Ptr{T}): cast pointer to Ptr{NTuple{N, VecElement{T}}} and call
-#     unsafe_load / unsafe_store!.  NTuple{N, VecElement{T}} is Julia's
-#     representation of LLVM's <N x T>; the Julia/LLVM compiler lowers this
-#     to a single wide memory op (no LoadStoreVectorizer needed).
+# CPU (Ptr{T}): cast pointer to Ptr{NTuple{N, VecElement{T}}} and call
+#   unsafe_load / unsafe_store!.  NTuple{N, VecElement{T}} is Julia's
+#   representation of LLVM's <N x T>; the Julia/LLVM compiler lowers this
+#   to a single wide memory op (no LoadStoreVectorizer needed).
 #
-# GPU / generic AbstractArray: use @generated to emit N consecutive
-#     compile-time-indexed array accesses (arr[idx+0], arr[idx+1], …).
-#     These route through `getindex` which generates element-level
-#     ld.global.f32 instructions; LLVM's LoadStoreVectorizer then merges
-#     them into ld.global.v4.f32 (CUDA) / global_load_dwordx4 (AMDGPU).
-#     @generated is required to avoid closures — closures in GPU kernels
-#     require heap allocation which the GPU compiler cannot handle.
+# GPU / non-Ptr (Core.LLVMPtr or similar): emit N loads/stores via
+#   Core.Intrinsics.pointerref / pointerset.  The FIRST access is annotated
+#   with vector-width alignment (N*sizeof(T) bytes); subsequent accesses carry
+#   only natural alignment (sizeof(T)).  LLVM's LoadStoreVectorizer sees the
+#   base alignment and merges the N scalar accesses into a single wide instruction:
+#     CUDA   → ld.global.v4.f32 / st.global.v4.f32
+#     AMDGPU → global_load_dwordx4 / global_store_dwordx4
+#   @generated is required to avoid closures — closures in GPU kernels
+#   require heap allocation which the GPU compiler cannot handle.
+#
+# Fallback (N=1, non-primitive types, or non-DenseArray): scalar arr[idx+k]
+#   accesses via @generated to avoid closures.
 
 # CPU path ────────────────────────────────────────────────────────────────────
 
@@ -297,7 +302,25 @@ end
     unsafe_store!(_vptr(p, Val(N)), ntuple(i -> Core.VecElement{T}(vals[i]), Val(N)))
 end
 
-# Generic/GPU path — @generated avoids closures ───────────────────────────────
+# GPU / non-Ptr path — alignment-hinted pointerref / pointerset ──────────────
+
+@generated function _vload_lptr(::Val{N}, p) where {N}
+    T = p.parameters[1]
+    vec_align = N * sizeof(T)   # e.g. 16 for N=4, Float32
+    nat_align = sizeof(T)
+    loads = [:(Core.Intrinsics.pointerref(p, $i, $(i == 1 ? vec_align : nat_align))) for i in 1:N]
+    Expr(:tuple, loads...)
+end
+
+@generated function _vstore_lptr!(p, ::Val{N}, vals::NTuple{N}) where {N}
+    T = p.parameters[1]
+    vec_align = N * sizeof(T)
+    nat_align = sizeof(T)
+    stores = [:(Core.Intrinsics.pointerset(p, vals[$i], $i, $(i == 1 ? vec_align : nat_align))) for i in 1:N]
+    Expr(:block, stores..., :nothing)
+end
+
+# Scalar fallback — used for N=1, non-primitive types, and non-DenseArrays ───
 
 @generated function _vload_arr(::Val{N}, arr::AbstractArray{T}, idx::Integer) where {N, T}
     Expr(:tuple, [:(Base.@inbounds arr[idx + $(i - 1)]) for i in 1:N]...)
@@ -324,15 +347,15 @@ On **CPU** (`Ptr{T}` path), for primitive element types this casts
 a single `unsafe_load`.  Julia lowers `NTuple{N, VecElement{T}}` to
 LLVM's `<N x T>` vector type — one wide memory op, no LoadStoreVectorizer.
 
-On **GPU** (and for all other `AbstractArray` subtypes), this emits N
-consecutive compile-time-indexed array accesses
-(`arr[idx]`, `arr[idx+1]`, …).  These resolve to element-level
-`ld.global.f32` instructions; LLVM's LoadStoreVectorizer (LSV) merges
-them into `ld.global.v4.f32` (CUDA) / `global_load_dwordx4` (AMDGPU)
-when the base address is suitably aligned.
+On **GPU** (and for all arrays whose `pointer` returns a non-CPU pointer),
+`Core.Intrinsics.pointerref` is used with vector-width alignment (`N*sizeof(T)`
+bytes) on the first element and natural alignment (`sizeof(T)`) on subsequent
+elements.  LLVM's LoadStoreVectorizer sees the alignment metadata and merges
+the N scalar accesses into a single wide instruction —
+`ld.global.v4.f32` (CUDA) or `global_load_dwordx4` (AMDGPU).
 
-For non-primitive element types (`N == 1` or composite types) the fallback
-emits N plain scalar loads.
+For non-primitive element types or `N == 1` the fallback emits N plain scalar
+array accesses (`arr[idx]`, `arr[idx+1]`, …).
 
 ### Requirements
 
@@ -369,7 +392,7 @@ end
         if p isa Ptr
             _vload_ptr(Val(N), p)
         else
-            _vload_arr(Val(N), arr, idx)
+            _vload_lptr(Val(N), p)
         end
     else
         # N=1 or non-primitive: plain scalar loads (VecElement<1x> is invalid in SPIRV/OpenCL)
@@ -387,9 +410,9 @@ index `idx`.
 
 The write complement of [`vload`](@ref).  On CPU this wraps `vals` in a
 `<N x T>` LLVM vector and calls a single `unsafe_store!` (one wide store).
-On GPU it emits N consecutive indexed stores (`arr[idx]=v0`, `arr[idx+1]=v1`,
-…) that LLVM's LoadStoreVectorizer merges into `st.global.v4.f32` (CUDA)
-or `global_store_dwordx4` (AMDGPU).
+On GPU it uses `Core.Intrinsics.pointerset` with vector-width alignment on the
+first store, which LLVM's LoadStoreVectorizer merges into `st.global.v4.f32`
+(CUDA) or `global_store_dwordx4` (AMDGPU).
 
 The same `N`-must-be-`Val`, no-`@Const`, and alignment requirements as
 [`vload`](@ref) apply.
@@ -406,7 +429,7 @@ The same `N`-must-be-`Val`, no-`@Const`, and alignment requirements as
         if p isa Ptr
             _vstore_ptr!(p, Val(N), vals)
         else
-            _vstore_arr!(arr, idx, Val(N), vals)
+            _vstore_lptr!(p, Val(N), vals)
         end
     else
         _vstore_arr!(arr, idx, Val(N), vals)
