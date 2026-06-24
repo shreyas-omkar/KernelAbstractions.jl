@@ -268,22 +268,101 @@ function sub_group_barrier()
     error("Sub-group barrier used outside kernel or not captured")
 end
 
-# ── Internal helpers: reinterpret a scalar pointer to an N-element vector pointer ──
+# ── Internal helpers for wide vector loads / stores ───────────────────────────
 #
-# On CPU  : pointer(arr, idx) → Ptr{T}          → Ptr{NTuple{N, VecElement{T}}}
-# On GPU  : pointer(arr, idx) → LLVMPtr{T, AS}  → LLVMPtr{NTuple{N, VecElement{T}}, AS}
+# Strategy
+# --------
+# CPU  (Ptr{T}): cast pointer to Ptr{NTuple{N, VecElement{T}}} and call
+#     unsafe_load / unsafe_store!.  NTuple{N, VecElement{T}} is Julia's
+#     representation of LLVM's <N x T>; the Julia/LLVM compiler lowers this
+#     to a single wide memory op without needing the LoadStoreVectorizer.
 #
-# NTuple{N, Core.VecElement{T}} lowers to LLVM's `<N x T>` vector type, which
-# the backend (NVPTX / AMDGPU) emits as a single wide memory instruction
-# (e.g. ld.global.v4.f32 / global_load_dwordx4) — exactly like PyTorch's
-# aligned_vector<scalar_t, N> trick, but backend-agnostic.
+# GPU  (Core.LLVMPtr{T, AS}): emit the LLVM instruction directly via
+#     llvmcall.  We cannot use the Ptr trick here because in practice
+#     `reinterpret(LLVMPtr{NTuple{…}}, p)` in older Julia/CUDA versions
+#     does NOT generate a single vector instruction — LLVM decomposes the
+#     struct into individual byte loads instead.
 #
-# We dispatch on pointer type rather than wrapping in a single generic method so
-# that GPU kernels only ever see the LLVMPtr branch (no dead Ptr branch in device IR).
-@inline _vptr(p::Ptr{T},              ::Val{N}) where {T, N}     =
+# Both paths produce a single wide memory instruction on the happy path
+# (ld.global.v4.f32 / global_load_dwordx4 on CUDA / AMDGPU).
+
+# CPU: reinterpret Ptr to a vector-pointer type
+@inline _vptr(p::Ptr{T}, ::Val{N}) where {T, N} =
     Ptr{NTuple{N, Core.VecElement{T}}}(p)
-@inline _vptr(p::Core.LLVMPtr{T, AS}, ::Val{N}) where {T, N, AS} =
-    reinterpret(Core.LLVMPtr{NTuple{N, Core.VecElement{T}}, AS}, p)
+
+@inline function _vload_ptr(::Val{N}, p::Ptr{T}) where {N, T}
+    raw = unsafe_load(_vptr(p, Val(N)))
+    ntuple(i -> raw[i].value, Val(N))
+end
+
+@inline function _vstore_ptr!(p::Ptr{T}, ::Val{N}, vals::NTuple{N, T}) where {N, T}
+    unsafe_store!(_vptr(p, Val(N)), ntuple(i -> Core.VecElement{T}(vals[i]), Val(N)))
+end
+
+# LLVM type-name map used by the @generated GPU helpers below.
+# Defining as a plain function lets @generated bodies call it at code-gen time.
+function _llvm_type_name end
+_llvm_type_name(::Type{Float16}) = "half"
+_llvm_type_name(::Type{Float32}) = "float"
+_llvm_type_name(::Type{Float64}) = "double"
+_llvm_type_name(::Type{Int8})    = "i8"
+_llvm_type_name(::Type{Int16})   = "i16"
+_llvm_type_name(::Type{Int32})   = "i32"
+_llvm_type_name(::Type{Int64})   = "i64"
+_llvm_type_name(::Type{UInt8})   = "i8"
+_llvm_type_name(::Type{UInt16})  = "i16"
+_llvm_type_name(::Type{UInt32})  = "i32"
+_llvm_type_name(::Type{UInt64})  = "i64"
+
+# GPU: emit `load <N x T>` / `store <N x T>` directly via llvmcall.
+# @generated so the LLVM IR string is a compile-time constant.
+@generated function _vload_llvm(::Val{N}, p::Core.LLVMPtr{T, AS}) where {N, T, AS}
+    if !hasmethod(_llvm_type_name, Tuple{Type{T}})
+        # Unknown type: N scalar loads (LLVM may still merge them via LSV)
+        return :(ntuple(i -> unsafe_load(Core.LLVMPtr{$T,$AS}(Int(p) + (i-1)*sizeof($T))), Val($N)))
+    end
+    lt = _llvm_type_name(T)
+    al = sizeof(T)
+    ir = "%v = load <$N x $lt>, $lt addrspace($AS)* %0, align $al\nret <$N x $lt> %v"
+    quote
+        raw = Base.llvmcall($ir, NTuple{$N, Core.VecElement{$T}},
+                            Tuple{Core.LLVMPtr{$T, $AS}}, p)
+        ntuple(i -> raw[i].value, Val($N))
+    end
+end
+
+@generated function _vstore_llvm!(p::Core.LLVMPtr{T, AS}, ::Val{N},
+                                  vals::NTuple{N, T}) where {N, T, AS}
+    if !hasmethod(_llvm_type_name, Tuple{Type{T}})
+        return quote
+            for i in 1:$N
+                unsafe_store!(Core.LLVMPtr{$T,$AS}(Int(p) + (i-1)*sizeof($T)), vals[i])
+            end
+            nothing
+        end
+    end
+    lt = _llvm_type_name(T)
+    al = sizeof(T)
+    # store <N x lt> %1, lt addrspace(AS)* %0  (%0=ptr, %1=value)
+    ir = "store <$N x $lt> %1, $lt addrspace($AS)* %0, align $al\nret void"
+    quote
+        vec_vals = ntuple(i -> Core.VecElement{$T}(vals[i]), Val($N))
+        Base.llvmcall($ir, Nothing,
+                     Tuple{Core.LLVMPtr{$T, $AS}, NTuple{$N, Core.VecElement{$T}}},
+                     p, vec_vals)
+    end
+end
+
+# Dispatch helpers — route to the correct implementation based on pointer type
+@inline _vload_dispatch(::Val{N}, p::Ptr{T}) where {N, T} =
+    _vload_ptr(Val(N), p)
+@inline _vload_dispatch(::Val{N}, p::Core.LLVMPtr{T, AS}) where {N, T, AS} =
+    _vload_llvm(Val(N), p)
+
+@inline _vstore_dispatch!(p::Ptr{T}, ::Val{N}, vals) where {N, T} =
+    _vstore_ptr!(p, Val(N), vals)
+@inline _vstore_dispatch!(p::Core.LLVMPtr{T, AS}, ::Val{N}, vals) where {N, T, AS} =
+    _vstore_llvm!(p, Val(N), vals)
 
 # ─── vload ───────────────────────────────────────────────────────────────────
 
@@ -341,9 +420,7 @@ end
 """
 @inline function vload(::Val{N}, arr::AbstractArray{T}, idx::Integer) where {N, T}
     if isprimitivetype(T) && N > 1
-        # Explicit <N x T> vector load — guaranteed single wide instruction
-        raw = unsafe_load(_vptr(pointer(arr, idx), Val(N)))
-        ntuple(i -> raw[i].value, Val(N))
+        _vload_dispatch(Val(N), pointer(arr, idx))
     else
         # N=1 or non-primitive: plain scalar loads (VecElement<1x> is invalid in SPIRV/OpenCL)
         ntuple(i -> @inbounds(arr[idx + i - 1]), Val(N))
@@ -373,8 +450,7 @@ The same `N`-must-be-`Val`, no-`@Const`, and alignment requirements as
 """
 @inline function vstore!(arr::AbstractArray{T}, idx::Integer, vals::NTuple{N, T}) where {N, T}
     if isprimitivetype(T) && N > 1
-        vec_vals = ntuple(i -> Core.VecElement{T}(vals[i]), Val(N))
-        unsafe_store!(_vptr(pointer(arr, idx), Val(N)), vec_vals)
+        _vstore_dispatch!(pointer(arr, idx), Val(N), vals)
     else
         for i in 1:N
             @inbounds arr[idx + i - 1] = vals[i]
