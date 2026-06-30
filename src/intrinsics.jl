@@ -661,4 +661,23 @@ macro kernel(backend, ex...)
     )
 end
 
+
+"""
+    sub_group_ballot(pred::Bool) -> UInt32
+
+Return a bitmask with bit `i-1` set for every lane where `pred` is true,
+where `i` is the 1-based sub-group local ID (`get_sub_group_local_id()`).
+
+Only CUDA and AMDGPU backends support this natively; SPIR-V/OpenCL has no
+ballot intrinsic. The CPU fallback returns `UInt32(pred)` (single-thread
+sub-group).
+
+!!! note
+    Backend implementations override this as:
+    ```julia
+    @device_override @inline KI.sub_group_ballot(pred::Bool) = ...
+    ```
+"""
+@inline sub_group_ballot(pred::Bool) = pred ? UInt32(1) : UInt32(0)
+
 end
