@@ -269,6 +269,27 @@ function sub_group_barrier()
 end
 
 """
+    sub_group_ballot(predicate::Bool)
+
+Returns a bitmask whose Nth bit is set if and only if `predicate` evaluates to
+`true` for the Nth work-item of the sub-group and that work-item is active.
+
+!!! note
+    Only available on backends where [`supports_sub_group_ballot`](@ref)
+    returns `true`.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    @device_override sub_group_ballot(predicate::Bool)
+    ```
+    if they set `supports_sub_group_ballot(backend::NewBackend) = true`.
+"""
+function sub_group_ballot(predicate::Bool)
+    error("sub_group_ballot used outside kernel or not captured")
+end
+
+"""
     _print(args...)
 
     Overloaded by backends to enable `KernelAbstractions.@print`
@@ -364,6 +385,22 @@ be 32, or 64 for devices that don't support 32.
     As well as the on-device functionality.
 """
 function sub_group_size end
+
+"""
+    supports_sub_group_ballot(backend)::Bool
+
+Returns whether `sub_group_ballot` is implemented and correct for the
+currently active device on the given backend.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    supports_sub_group_ballot(backend::NewBackend)::Bool
+    ```
+    if they implement `sub_group_ballot`. Defaults to `false`.
+"""
+supports_sub_group_ballot(::Backend) = false
+
 
 """
     multiprocessor_count(backend::NewBackend)::Int
