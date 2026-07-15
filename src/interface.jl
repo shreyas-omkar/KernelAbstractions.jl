@@ -14,6 +14,7 @@ module KernelInterface
 
 import ..KernelAbstractions: Backend
 import GPUCompiler: split_kwargs, assign_args!
+import UnsafeAtomics
 
 """
     get_global_size()::@NamedTuple{x::Int, y::Int, z::Int}
@@ -138,6 +139,31 @@ be visible to a thread in a different workgroup.
 function barrier()
     error("Group barrier used outside kernel or not captured")
 end
+
+"""
+    device_fence()
+
+Device-scope memory fence.  Orders this work-item's global-memory operations issued *before*
+the fence ahead of those issued *after* it, as observed by work-items in **other** work-groups
+(i.e. across the whole device / grid).
+
+Unlike [`barrier`](@ref) this is a pure memory fence: it does **not** synchronize execution and
+is not restricted to a single work-group.  Use it — together with relaxed (`monotonic`) atomic
+loads/stores on the shared locations — to publish and consume data between work-groups, e.g. a
+decoupled look-back scan.
+
+The generic definition emits an acquire-release atomic fence, which lowers on OpenCL/SPIR-V,
+Metal, oneAPI and AMDGPU.  A backend only needs to provide
+
+```
+@device_override device_fence()
+```
+
+when that generic fence does not lower or is not device-scope on its toolchain.  The CUDA
+backend does so, because NVPTX does not select scoped atomic fences — it uses a native
+`threadfence` (`membar.gl`) instead.
+"""
+@inline device_fence() = UnsafeAtomics.fence(UnsafeAtomics.acq_rel)
 
 """
     _print(args...)

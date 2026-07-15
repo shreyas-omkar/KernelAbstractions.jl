@@ -20,14 +20,17 @@ SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
 SPIRV_Tools_jll = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 pocl_standalone_jll = "54f56a70-6062-5590-a942-1226658f6c83"
 
 [weakdeps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [extensions]
+CUDAExt = "CUDA"
 EnzymeExt = "EnzymeCore"
 LinearAlgebraExt = "LinearAlgebra"
 SparseArraysExt = "SparseArrays"
@@ -35,6 +38,7 @@ SparseArraysExt = "SparseArrays"
 [compat]
 Adapt = "0.4, 1.0, 2.0, 3.0, 4"
 Atomix = "0.1, 1"
+CUDA = "5, 6"
 EnzymeCore = "0.7, 0.8.1"
 GPUCompiler = "1.13.3"
 InteractiveUtils = "1.6"
@@ -52,6 +56,7 @@ SPIRV_Tools_jll = "2024.4, 2025.1"
 SparseArrays = "<0.0.1, 1.6"
 StaticArrays = "0.12, 1.0"
 UUIDs = "<0.0.1, 1.6"
+UnsafeAtomics = "0.3"
 julia = "1.10"
 pocl_standalone_jll = "7.2"
 
